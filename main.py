@@ -2,8 +2,7 @@ import os
 import io
 import base64
 import uuid
-import re
-from pathlib import Path
+import logging
 from typing import Optional
 
 import pdfplumber
@@ -11,15 +10,15 @@ import chromadb
 import google.generativeai as genai
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ── 환경변수 ──────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ── ChromaDB 초기화 ───────────────────────────────────────────
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(
@@ -27,7 +26,6 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"},
 )
 
-# ── FastAPI 앱 ────────────────────────────────────────────────
 app = FastAPI(title="문제집 출처 탐색 RAG API", version="1.0.0")
 
 app.add_middleware(
@@ -39,50 +37,61 @@ app.add_middleware(
 )
 
 
-# ── 유틸 함수 ────────────────────────────────────────────────
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
-    """PDF에서 페이지별 텍스트 추출 (텍스트 기반 + 이미지 기반 모두 지원)"""
     pages = []
-    
-    # 먼저 텍스트 기반으로 시도
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            if not text.strip():
-                words = page.extract_words()
-                text = " ".join([w["text"] for w in words])
-            text = text.strip()
-            if text:
-                pages.append({"page": i, "text": text})
-    
-    # 텍스트 추출 실패시 Gemini Vision으로 OCR
-    if not pages:
-        import fitz
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        for i, page in enumerate(doc, start=1):
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("jpeg")
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-            prompt = "이 교재 페이지에서 문제, 선택지, 지문 텍스트를 전부 추출해줘. 텍스트만 출력해."
-            try:
-                response = model.generate_content([
-                    prompt,
-                    {"mime_type": "image/jpeg", "data": img_b64}
-                ])
-                text = response.text.strip()
+
+    # 1단계: pdfplumber로 텍스트 추출 시도
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text() or ""
+                if not text.strip():
+                    words = page.extract_words()
+                    text = " ".join([w["text"] for w in words])
+                text = text.strip()
                 if text:
                     pages.append({"page": i, "text": text})
-            except Exception:
-                continue
-        doc.close()
-    
+        logger.info(f"pdfplumber 추출 결과: {len(pages)}페이지")
+    except Exception as e:
+        logger.error(f"pdfplumber 오류: {e}")
+
+    # 2단계: 텍스트 없으면 Gemini Vision OCR
+    if not pages:
+        logger.info("텍스트 없음 → Gemini OCR 시도")
+        try:
+            import fitz
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total = len(doc)
+            logger.info(f"PDF 페이지 수: {total}")
+            model = genai.GenerativeModel("gemini-1.5-flash")
+
+            for i in range(min(total, 20)):  # 최대 20페이지
+                page = doc[i]
+                mat = fitz.Matrix(1.5, 1.5)
+                pix = page.get_pixmap(matrix=mat)
+                img_bytes = pix.tobytes("jpeg")
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                prompt = "이 교재 페이지에서 문제, 선택지, 지문 텍스트를 전부 추출해줘. 텍스트만 출력해."
+                try:
+                    response = model.generate_content([
+                        prompt,
+                        {"mime_type": "image/jpeg", "data": img_b64}
+                    ])
+                    text = response.text.strip()
+                    logger.info(f"페이지 {i+1} OCR 완료: {len(text)}자")
+                    if text:
+                        pages.append({"page": i + 1, "text": text})
+                except Exception as e:
+                    logger.error(f"페이지 {i+1} OCR 오류: {e}")
+                    continue
+            doc.close()
+        except Exception as e:
+            logger.error(f"fitz/OCR 전체 오류: {e}")
+
     return pages
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
-    """텍스트를 청크로 분할"""
     chunks = []
     start = 0
     while start < len(text):
@@ -93,7 +102,6 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
 
 
 def get_embedding(text: str) -> list[float]:
-    """Gemini embedding API 호출"""
     result = genai.embed_content(
         model="models/text-embedding-004",
         content=text,
@@ -112,7 +120,6 @@ def get_query_embedding(text: str) -> list[float]:
 
 
 def extract_text_from_image_base64(image_base64: str, mime_type: str = "image/jpeg") -> str:
-    """Gemini Vision으로 시험지 이미지에서 문제 텍스트 추출"""
     model = genai.GenerativeModel("gemini-1.5-flash")
     image_data = {"mime_type": mime_type, "data": image_base64}
     prompt = (
@@ -123,8 +130,6 @@ def extract_text_from_image_base64(image_base64: str, mime_type: str = "image/jp
     response = model.generate_content([prompt, image_data])
     return response.text.strip()
 
-
-# ── API 엔드포인트 ────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -143,14 +148,15 @@ async def upload_workbook(
     workbook_name: str = Form(...),
     subject: Optional[str] = Form(None),
 ):
-    """
-    문제집 PDF 업로드 → 텍스트 추출 → ChromaDB 저장
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
 
+    logger.info(f"업로드 시작: {file.filename}, 문제집명: {workbook_name}")
     file_bytes = await file.read()
+    logger.info(f"파일 크기: {len(file_bytes)} bytes")
+
     pages = extract_text_from_pdf(file_bytes)
+    logger.info(f"추출된 페이지 수: {len(pages)}")
 
     if not pages:
         raise HTTPException(status_code=400, detail="PDF에서 텍스트를 추출할 수 없습니다.")
@@ -169,6 +175,7 @@ async def upload_workbook(
             try:
                 emb = get_embedding(chunk)
             except Exception as e:
+                logger.error(f"임베딩 오류: {e}")
                 continue
 
             chunk_id = f"{workbook_name}__p{page_num}__c{chunk_idx}__{uuid.uuid4().hex[:6]}"
@@ -206,9 +213,6 @@ class SearchByTextRequest(BaseModel):
 
 @app.post("/search-by-text")
 async def search_by_text(req: SearchByTextRequest):
-    """
-    텍스트로 ChromaDB 검색 → 출처 반환
-    """
     if collection.count() == 0:
         raise HTTPException(status_code=404, detail="인덱싱된 문제집이 없습니다.")
 
@@ -242,9 +246,6 @@ async def search_by_image(
     file: UploadFile = File(...),
     top_k: int = Form(5),
 ):
-    """
-    시험지 사진 업로드 → Gemini OCR → ChromaDB 검색 → 출처 반환
-    """
     if collection.count() == 0:
         raise HTTPException(status_code=404, detail="인덱싱된 문제집이 없습니다.")
 
@@ -256,7 +257,6 @@ async def search_by_image(
     file_bytes = await file.read()
     image_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
-    # Gemini로 텍스트 추출
     try:
         extracted_text = extract_text_from_image_base64(image_base64, mime_type=content_type)
     except Exception as e:
@@ -265,7 +265,6 @@ async def search_by_image(
     if not extracted_text:
         raise HTTPException(status_code=400, detail="이미지에서 텍스트를 추출할 수 없습니다.")
 
-    # ChromaDB 검색
     query_emb = get_query_embedding(extracted_text)
     results = collection.query(
         query_embeddings=[query_emb],
@@ -296,7 +295,6 @@ async def search_by_image(
 
 @app.get("/workbooks")
 def list_workbooks():
-    """등록된 문제집 목록 조회"""
     if collection.count() == 0:
         return {"workbooks": []}
 
@@ -317,7 +315,6 @@ def list_workbooks():
 
 @app.delete("/workbook/{workbook_name}")
 def delete_workbook(workbook_name: str):
-    """문제집 삭제"""
     results = collection.get(
         where={"workbook_name": workbook_name},
         include=["metadatas"],
