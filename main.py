@@ -40,7 +40,6 @@ app.add_middleware(
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
     pages = []
 
-    # 1단계: pdfplumber로 텍스트 추출 시도
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
@@ -55,17 +54,17 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
     except Exception as e:
         logger.error(f"pdfplumber 오류: {e}")
 
-    # 2단계: 텍스트 없으면 Gemini Vision OCR
     if not pages:
         logger.info("텍스트 없음 → Gemini OCR 시도")
         try:
             import fitz
+            logger.info("fitz import 성공")
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             total = len(doc)
             logger.info(f"PDF 페이지 수: {total}")
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.0-flash")
 
-            for i in range(min(total, 20)):  # 최대 20페이지
+            for i in range(min(total, 20)):
                 page = doc[i]
                 mat = fitz.Matrix(1.5, 1.5)
                 pix = page.get_pixmap(matrix=mat)
@@ -75,7 +74,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
                 try:
                     response = model.generate_content([
                         prompt,
-                       {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+                        {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
                     ])
                     text = response.text.strip()
                     logger.info(f"페이지 {i+1} OCR 완료: {len(text)}자")
@@ -120,7 +119,7 @@ def get_query_embedding(text: str) -> list[float]:
 
 
 def extract_text_from_image_base64(image_base64: str, mime_type: str = "image/jpeg") -> str:
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     image_data = {"mime_type": mime_type, "data": image_base64}
     prompt = (
         "이 시험지 이미지에서 문제 텍스트를 최대한 정확하게 추출해줘. "
