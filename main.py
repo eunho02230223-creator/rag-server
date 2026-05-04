@@ -75,7 +75,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
                 try:
                     response = model.generate_content([
                         prompt,
-                        {"mime_type": "image/jpeg", "data": img_b64}
+                       {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
                     ])
                     text = response.text.strip()
                     logger.info(f"페이지 {i+1} OCR 완료: {len(text)}자")
