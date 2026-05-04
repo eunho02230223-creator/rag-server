@@ -46,6 +46,9 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
+            if not text.strip():
+                words = page.extract_words()
+                text = " ".join([w["text"] for w in words])
             text = text.strip()
             if text:
                 pages.append({"page": i, "text": text})
