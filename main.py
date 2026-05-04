@@ -41,8 +41,10 @@ app.add_middleware(
 
 # ── 유틸 함수 ────────────────────────────────────────────────
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
-    """PDF에서 페이지별 텍스트 추출"""
+    """PDF에서 페이지별 텍스트 추출 (텍스트 기반 + 이미지 기반 모두 지원)"""
     pages = []
+    
+    # 먼저 텍스트 기반으로 시도
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
@@ -52,6 +54,30 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
             text = text.strip()
             if text:
                 pages.append({"page": i, "text": text})
+    
+    # 텍스트 추출 실패시 Gemini Vision으로 OCR
+    if not pages:
+        import fitz
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        for i, page in enumerate(doc, start=1):
+            mat = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("jpeg")
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            prompt = "이 교재 페이지에서 문제, 선택지, 지문 텍스트를 전부 추출해줘. 텍스트만 출력해."
+            try:
+                response = model.generate_content([
+                    prompt,
+                    {"mime_type": "image/jpeg", "data": img_b64}
+                ])
+                text = response.text.strip()
+                if text:
+                    pages.append({"page": i, "text": text})
+            except Exception:
+                continue
+        doc.close()
+    
     return pages
 
 
